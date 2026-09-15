@@ -832,6 +832,16 @@ sensitivity tables, and preset baselines.
 
 ## Known Bugs
 
+**SharpYUV input interpretation (2026-09-14, reproduced on v0.8.4):**
+`zenjpeg/src/encode/strip/convert.rs:786` passes only bytes per pixel to
+`gamma_aware_strip_*`; `zenjpeg/src/encode/chroma.rs:53` and its chroma helpers
+read the first three bytes as sRGB channels. Linear f32/u16 and BGR layouts
+therefore corrupt colours. `sharp_yuv_input_formats` reproduces this with
+generated patches, odd sizes, row padding and seven-row pushes. A 1x1 sample
+has maximum channel error 63 for f32 and 162 for u16 against equivalent RGB8.
+Fix at the internal format dispatch and share the existing gamma/iterative
+math; preserve exported byte-helper signatures and fractional sample precision.
+
 ~~1. **Catastrophic 4:2:0 auto_optimize quality at specific Q levels (2026-02-19)**~~ —
    **FIXED (2026-03-09, commit 08ef601).** Root cause was progressive decoder truncation near
    restart markers (see Fixed Bugs below), NOT encoder trellis lambda weights. The trellis
