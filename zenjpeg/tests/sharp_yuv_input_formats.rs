@@ -3,7 +3,8 @@
 
 use std::io::Cursor;
 use zenjpeg::encoder::{
-    ChromaSubsampling, EncoderConfig, PixelLayout, ProgressiveScanMode, Unstoppable,
+    ChromaSubsampling, DownsamplingMethod, EncoderConfig, PixelLayout, ProgressiveScanMode,
+    Unstoppable,
 };
 
 fn linear(v: f32) -> f32 {
@@ -71,11 +72,12 @@ fn encode(
     layout: PixelLayout,
     chroma: ChromaSubsampling,
     strided: bool,
+    method: DownsamplingMethod,
 ) -> Vec<u8> {
     let config = EncoderConfig::ycbcr(99, chroma)
         .auto_optimize(true)
         .scan_mode(ProgressiveScanMode::ProgressiveSearch)
-        .sharp_yuv(true);
+        .downsampling_method(method);
     let mut enc = config
         .encode_from_bytes(w as u32, h as u32, layout)
         .unwrap();
@@ -98,6 +100,15 @@ fn encode(
 }
 
 fn compare_layout(layout: PixelLayout) {
+    for method in [
+        DownsamplingMethod::GammaAware,
+        DownsamplingMethod::GammaAwareIterative,
+    ] {
+        compare_layout_with_method(layout, method);
+    }
+}
+
+fn compare_layout_with_method(layout: PixelLayout, method: DownsamplingMethod) {
     for (w, h) in [(1, 1), (1, 35), (33, 1), (33, 35), (64, 67)] {
         let rgb = source(w, h);
         let data = pixels(&rgb, layout);
@@ -107,12 +118,12 @@ fn compare_layout(layout: PixelLayout) {
             ChromaSubsampling::Quarter,
             ChromaSubsampling::HalfVertical,
         ] {
-            let reference = encode(&rgb, w, h, PixelLayout::Rgb8Srgb, chroma, false);
-            let candidate = encode(&data, w, h, layout, chroma, false);
+            let reference = encode(&rgb, w, h, PixelLayout::Rgb8Srgb, chroma, false, method);
+            let candidate = encode(&data, w, h, layout, chroma, false, method);
             assert_eq!(
                 candidate,
-                encode(&data, w, h, layout, chroma, true),
-                "padding/chunking changed pixels: {layout:?} {chroma:?} {w}x{h}"
+                encode(&data, w, h, layout, chroma, true, method),
+                "padding/chunking changed pixels: {layout:?} {chroma:?} {method:?} {w}x{h}"
             );
             let decode = |bytes: &[u8]| {
                 jpeg_decoder::Decoder::new(Cursor::new(bytes))
@@ -137,7 +148,7 @@ fn compare_layout(layout: PixelLayout) {
                 .unwrap();
             assert!(
                 mae < 0.8 && max <= 6,
-                "{layout:?} {chroma:?} {w}x{h}: MAE {mae}, max {max}"
+                "{layout:?} {chroma:?} {method:?} {w}x{h}: MAE {mae}, max {max}"
             );
         }
     }
@@ -182,7 +193,15 @@ fn sharp_yuv_preserves_fractional_input() {
             let data: Vec<u8> = (0..16 * 16 * 3)
                 .flat_map(|_| linear(v / 255.0).to_ne_bytes())
                 .collect();
-            encode(&data, 16, 16, PixelLayout::RgbF32Linear, chroma, false)
+            encode(
+                &data,
+                16,
+                16,
+                PixelLayout::RgbF32Linear,
+                chroma,
+                false,
+                DownsamplingMethod::GammaAwareIterative,
+            )
         };
         // Both values become 127 if input is rounded to eight bits first.
         assert_ne!(encode_gray(127.05), encode_gray(127.45));

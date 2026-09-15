@@ -30,7 +30,194 @@ use crate::color::xyb::{linear_to_srgb_fast, srgb_u8_to_linear};
 use crate::error::{Error, Result};
 use crate::foundation::alloc::{checked_size_2d, try_alloc_zeroed_f32};
 use crate::foundation::consts::{YCBCR_B_TO_Y, YCBCR_G_TO_Y, YCBCR_R_TO_Y};
-use crate::types::PixelFormat;
+use crate::types::{PixelFormat, Subsampling};
+
+/// Sample interpretation for the shared gamma-aware math. RGB8 is encoded
+/// sRGB; u16/f32 are normalized linear sRGB. Alpha and padding are ignored.
+/// The row stride is explicit in pixels; input reads do not require alignment.
+#[derive(Clone, Copy)]
+struct RgbReader {
+    format: PixelFormat,
+    bpp: usize,
+    width: usize,
+    stride: usize,
+}
+
+impl RgbReader {
+    fn new(format: PixelFormat, width: usize, stride: usize) -> Result<Self> {
+        match format {
+            PixelFormat::Rgb
+            | PixelFormat::Rgba
+            | PixelFormat::Bgr
+            | PixelFormat::Bgra
+            | PixelFormat::Bgrx
+            | PixelFormat::Rgb16
+            | PixelFormat::Rgba16
+            | PixelFormat::RgbF32
+            | PixelFormat::RgbaF32 => {}
+            _ => {
+                return Err(Error::invalid_color_format(
+                    "gamma-aware downsampling requires RGB input",
+                ));
+            }
+        }
+        Ok(Self {
+            format,
+            bpp: format.bytes_per_pixel(),
+            width,
+            stride,
+        })
+    }
+
+    #[inline]
+    fn offset(self, pixel: usize) -> usize {
+        let pixel = if self.width == self.stride {
+            pixel
+        } else {
+            (pixel / self.width) * self.stride + pixel % self.width
+        };
+        pixel * self.bpp
+    }
+
+    #[inline]
+    fn srgb_rgb(self, data: &[u8], pixel: usize) -> (f32, f32, f32) {
+        match self.format {
+            PixelFormat::Rgb16
+            | PixelFormat::Rgba16
+            | PixelFormat::RgbF32
+            | PixelFormat::RgbaF32 => {
+                let (r, g, b) = self.linear_rgb(data, pixel);
+                let encode = super::linear_lut::linear_f32_to_srgb_255_fast;
+                (encode(r), encode(g), encode(b))
+            }
+            _ => {
+                let idx = self.offset(pixel);
+                if matches!(
+                    self.format,
+                    PixelFormat::Bgr | PixelFormat::Bgra | PixelFormat::Bgrx
+                ) {
+                    (data[idx + 2] as f32, data[idx + 1] as f32, data[idx] as f32)
+                } else {
+                    (data[idx] as f32, data[idx + 1] as f32, data[idx + 2] as f32)
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn linear_rgb(self, data: &[u8], pixel: usize) -> (f32, f32, f32) {
+        let idx = self.offset(pixel);
+        match self.format {
+            PixelFormat::Rgb16 | PixelFormat::Rgba16 => {
+                let [r, g, b]: [u16; 3] = bytemuck::pod_read_unaligned(&data[idx..idx + 6]);
+                (r as f32 / 65535.0, g as f32 / 65535.0, b as f32 / 65535.0)
+            }
+            PixelFormat::RgbF32 | PixelFormat::RgbaF32 => {
+                let [r, g, b]: [f32; 3] = bytemuck::pod_read_unaligned(&data[idx..idx + 12]);
+                // These layouts describe SDR linear samples in [0, 1].
+                (r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0))
+            }
+            _ => {
+                let (r, g, b) = self.srgb_rgb(data, pixel);
+                (
+                    srgb_u8_to_linear(r as u8),
+                    srgb_u8_to_linear(g as u8),
+                    srgb_u8_to_linear(b as u8),
+                )
+            }
+        }
+    }
+}
+
+// The exported byte-only helpers retain their original signatures and RGB8
+// interpretation. They share the same math with the format-aware encoder path.
+impl From<usize> for RgbReader {
+    fn from(bpp: usize) -> Self {
+        Self {
+            format: PixelFormat::Rgb,
+            bpp,
+            width: 1,
+            stride: 1,
+        }
+    }
+}
+
+/// Encode a strip using its actual sample type and channel order. Outputs are
+/// tightly packed full-range BT.601 YCbCr f32 planes, ready for DCT processing.
+/// No RGB8 intermediate or additional strip/image allocation is introduced.
+pub(crate) fn gamma_aware_strip(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    stride_pixels: usize,
+    format: PixelFormat,
+    subsampling: Subsampling,
+    iterative: bool,
+    y: &mut [f32],
+    cb: &mut [f32],
+    cr: &mut [f32],
+) -> Result<()> {
+    if width == 0 || height == 0 || stride_pixels < width {
+        return Err(Error::invalid_dimensions(
+            width as u32,
+            height as u32,
+            "invalid gamma-aware strip dimensions or stride",
+        ));
+    }
+    let reader = RgbReader::new(format, width, stride_pixels)?;
+    let needed = (height - 1)
+        .checked_mul(stride_pixels)
+        .and_then(|v| v.checked_add(width))
+        .and_then(|v| v.checked_mul(reader.bpp))
+        .ok_or_else(|| Error::size_overflow("gamma-aware input"))?;
+    if data.len() < needed {
+        return Err(Error::invalid_buffer_size(needed, data.len()));
+    }
+    let (hf, vf) = match subsampling {
+        Subsampling::S420 => (2, 2),
+        Subsampling::S422 => (2, 1),
+        Subsampling::S440 => (1, 2),
+        Subsampling::S444 => {
+            return Err(Error::invalid_color_format(
+                "gamma-aware strip requires subsampled chroma",
+            ));
+        }
+    };
+    let cw = width.div_ceil(hf);
+    let ch = height.div_ceil(vf);
+    let y_size = checked_size_2d(width, height)?;
+    let c_size = checked_size_2d(cw, ch)?;
+    for (actual, needed) in [(y.len(), y_size), (cb.len(), c_size), (cr.len(), c_size)] {
+        if actual < needed {
+            return Err(Error::invalid_buffer_size(needed, actual));
+        }
+    }
+    compute_y_plane_from_rgb(data, width, height, reader, y);
+    for cy in 0..ch {
+        for cx in 0..cw {
+            let (u, v) = match (subsampling, iterative) {
+                (Subsampling::S420, false) => {
+                    gamma_aware_chroma_2x2(data, width, height, reader, cx, cy)
+                }
+                (Subsampling::S420, true) => {
+                    iterative_chroma_2x2(data, y, width, height, reader, cx, cy)
+                }
+                (Subsampling::S422, false) => gamma_aware_chroma_2x1(data, width, reader, cx, cy),
+                (Subsampling::S422, true) => iterative_chroma_2x1(data, y, width, reader, cx, cy),
+                (Subsampling::S440, false) => {
+                    gamma_aware_chroma_1x2(data, width, height, reader, cx, cy)
+                }
+                (Subsampling::S440, true) => {
+                    iterative_chroma_1x2(data, y, width, height, reader, cx, cy)
+                }
+                (Subsampling::S444, _) => unreachable!(),
+            };
+            cb[cy * cw + cx] = u;
+            cr[cy * cw + cx] = v;
+        }
+    }
+    Ok(())
+}
 
 // ============================================================================
 // Constants
@@ -48,20 +235,18 @@ const CONVERGENCE_THRESHOLD: f32 = 0.1;
 // Helper Functions
 // ============================================================================
 
-/// Compute Y (luminance) plane from interleaved RGB u8 data.
+/// Compute Y (luminance) using the input sample type and channel order.
 fn compute_y_plane_from_rgb(
     data: &[u8],
     width: usize,
     height: usize,
-    bpp: usize,
+    bpp: impl Into<RgbReader> + Copy,
     y_plane: &mut [f32],
 ) {
+    let reader = bpp.into();
     let num_pixels = width * height;
     for i in 0..num_pixels {
-        let idx = i * bpp;
-        let r = data[idx] as f32;
-        let g = data[idx + 1] as f32;
-        let b = data[idx + 2] as f32;
+        let (r, g, b) = reader.srgb_rgb(data, i);
         y_plane[i] = YCBCR_R_TO_Y * r + YCBCR_G_TO_Y * g + YCBCR_B_TO_Y * b;
     }
 }
@@ -611,24 +796,19 @@ fn gamma_aware_chroma_2x2(
     data: &[u8],
     width: usize,
     height: usize,
-    bpp: usize,
+    bpp: impl Into<RgbReader> + Copy,
     cx: usize,
     cy: usize,
 ) -> (f32, f32) {
+    let reader = bpp.into();
     let x0 = cx * 2;
     let y0 = cy * 2;
     let x1 = (x0 + 1).min(width - 1);
     let y1 = (y0 + 1).min(height - 1);
 
     // Get RGB values for all 4 pixels and convert to linear using LUT
-    let get_linear_rgb = |x: usize, y: usize| -> (f32, f32, f32) {
-        let idx = (y * width + x) * bpp;
-        (
-            srgb_u8_to_linear(data[idx]),
-            srgb_u8_to_linear(data[idx + 1]),
-            srgb_u8_to_linear(data[idx + 2]),
-        )
-    };
+    let get_linear_rgb =
+        |x: usize, y: usize| -> (f32, f32, f32) { reader.linear_rgb(data, y * width + x) };
 
     let (lr00, lg00, lb00) = get_linear_rgb(x0, y0);
     let (lr10, lg10, lb10) = get_linear_rgb(x1, y0);
@@ -655,21 +835,15 @@ fn gamma_aware_chroma_2x2(
 fn gamma_aware_chroma_2x1(
     data: &[u8],
     width: usize,
-    bpp: usize,
+    bpp: impl Into<RgbReader> + Copy,
     cx: usize,
     y: usize,
 ) -> (f32, f32) {
+    let reader = bpp.into();
     let x0 = cx * 2;
     let x1 = (x0 + 1).min(width - 1);
 
-    let get_linear_rgb = |x: usize| -> (f32, f32, f32) {
-        let idx = (y * width + x) * bpp;
-        (
-            srgb_u8_to_linear(data[idx]),
-            srgb_u8_to_linear(data[idx + 1]),
-            srgb_u8_to_linear(data[idx + 2]),
-        )
-    };
+    let get_linear_rgb = |x: usize| -> (f32, f32, f32) { reader.linear_rgb(data, y * width + x) };
 
     let (lr0, lg0, lb0) = get_linear_rgb(x0);
     let (lr1, lg1, lb1) = get_linear_rgb(x1);
@@ -693,21 +867,15 @@ fn gamma_aware_chroma_1x2(
     data: &[u8],
     width: usize,
     height: usize,
-    bpp: usize,
+    bpp: impl Into<RgbReader> + Copy,
     x: usize,
     cy: usize,
 ) -> (f32, f32) {
+    let reader = bpp.into();
     let y0 = cy * 2;
     let y1 = (y0 + 1).min(height - 1);
 
-    let get_linear_rgb = |y: usize| -> (f32, f32, f32) {
-        let idx = (y * width + x) * bpp;
-        (
-            srgb_u8_to_linear(data[idx]),
-            srgb_u8_to_linear(data[idx + 1]),
-            srgb_u8_to_linear(data[idx + 2]),
-        )
-    };
+    let get_linear_rgb = |y: usize| -> (f32, f32, f32) { reader.linear_rgb(data, y * width + x) };
 
     let (lr0, lg0, lb0) = get_linear_rgb(y0);
     let (lr1, lg1, lb1) = get_linear_rgb(y1);
@@ -742,10 +910,11 @@ fn iterative_chroma_2x2(
     y_plane: &[f32],
     width: usize,
     height: usize,
-    bpp: usize,
+    bpp: impl Into<RgbReader> + Copy,
     cx: usize,
     cy: usize,
 ) -> (f32, f32) {
+    let reader = bpp.into();
     let x0 = cx * 2;
     let y0 = cy * 2;
     let x1 = (x0 + 1).min(width - 1);
@@ -760,10 +929,7 @@ fn iterative_chroma_2x2(
     ];
 
     // Get original RGB values (0-255 range)
-    let get_rgb = |x: usize, y: usize| -> (f32, f32, f32) {
-        let idx = (y * width + x) * bpp;
-        (data[idx] as f32, data[idx + 1] as f32, data[idx + 2] as f32)
-    };
+    let get_rgb = |x: usize, y: usize| -> (f32, f32, f32) { reader.srgb_rgb(data, y * width + x) };
 
     let orig_rgb = [
         get_rgb(x0, y0),
@@ -828,19 +994,17 @@ fn iterative_chroma_2x1(
     data: &[u8],
     y_plane: &[f32],
     width: usize,
-    bpp: usize,
+    bpp: impl Into<RgbReader> + Copy,
     cx: usize,
     y: usize,
 ) -> (f32, f32) {
+    let reader = bpp.into();
     let x0 = cx * 2;
     let x1 = (x0 + 1).min(width - 1);
 
     let y_vals = [y_plane[y * width + x0], y_plane[y * width + x1]];
 
-    let get_rgb = |x: usize| -> (f32, f32, f32) {
-        let idx = (y * width + x) * bpp;
-        (data[idx] as f32, data[idx + 1] as f32, data[idx + 2] as f32)
-    };
+    let get_rgb = |x: usize| -> (f32, f32, f32) { reader.srgb_rgb(data, y * width + x) };
 
     let orig_rgb = [get_rgb(x0), get_rgb(x1)];
 
@@ -889,19 +1053,17 @@ fn iterative_chroma_1x2(
     y_plane: &[f32],
     width: usize,
     height: usize,
-    bpp: usize,
+    bpp: impl Into<RgbReader> + Copy,
     x: usize,
     cy: usize,
 ) -> (f32, f32) {
+    let reader = bpp.into();
     let y0 = cy * 2;
     let y1 = (y0 + 1).min(height - 1);
 
     let y_vals = [y_plane[y0 * width + x], y_plane[y1 * width + x]];
 
-    let get_rgb = |y: usize| -> (f32, f32, f32) {
-        let idx = (y * width + x) * bpp;
-        (data[idx] as f32, data[idx + 1] as f32, data[idx + 2] as f32)
-    };
+    let get_rgb = |y: usize| -> (f32, f32, f32) { reader.srgb_rgb(data, y * width + x) };
 
     let orig_rgb = [get_rgb(y0), get_rgb(y1)];
 
