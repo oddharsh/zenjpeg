@@ -164,6 +164,11 @@ pub use crate::types::Limits;
 #[doc(hidden)]
 pub use crate::encode::tables;
 
+/// Types for [`QuantTableConfig::Custom`]. Without them the variant cannot be
+/// constructed outside this crate. Use `ScalingParams::Exact` to write the
+/// given tables verbatim.
+pub use crate::encode::tuning::{EncodingTables, PerComponent, ScalingParams};
+
 #[cfg(feature = "parallel")]
 pub use crate::encode::encoder_types::ParallelEncoding;
 
